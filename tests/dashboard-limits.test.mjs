@@ -78,7 +78,16 @@ test("the dashboard counts the hourly limits of what costs something each call",
 			.filter(({ limitDashboard }) => !limitDashboard)
 			.map(({ name }) => name)
 			.sort(),
-		["create_api_key", "create_campaign", "delete_contact", "duplicate_campaign", "export_contacts", "preview_campaign_cleanup"],
+		[
+			"create_api_key",
+			"create_campaign",
+			"create_sequence",
+			"delete_contact",
+			"duplicate_campaign",
+			"export_contacts",
+			"preview_campaign_cleanup",
+			"set_sequence_step",
+		],
 		"drafts, keys, deletes, exports and counts stay inside MailCheap"
 	);
 	const imports = m.registry.getAction("import_contacts");

@@ -7,6 +7,7 @@ import { confirmContact } from "@/lib/contacts";
 import { connectDb } from "@/lib/db";
 import { findOpenNewsletter } from "@/lib/public-newsletters";
 import { queueWelcomeEmail } from "@/lib/sending";
+import { startSequences } from "@/lib/sequences";
 
 export async function confirmSubscription(token) {
 	const reference = verifyConfirmToken(token);
@@ -24,6 +25,12 @@ export async function confirmSubscription(token) {
 			queueWelcomeEmail({ newsletter, contact }).catch((error) =>
 				console.error(`[confirm] Welcome email for ${contact._id} failed:`, error.message)
 			)
+		);
+	}
+	// A newsletter that confirms signups starts its sequences here, from the confirmation.
+	if (confirmed) {
+		after(() =>
+			startSequences({ newsletter, contact }).catch((error) => console.error(`[confirm] Sequences for ${contact._id} failed:`, error.message))
 		);
 	}
 	return { ok: true };

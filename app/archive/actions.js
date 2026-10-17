@@ -10,6 +10,7 @@ import { getInbox } from "@/lib/inbox-links";
 import { findSignupNewsletter } from "@/lib/public-newsletters";
 import { getClientIp, isRateLimited } from "@/lib/rate-limit";
 import { queueConfirmationEmail, queueWelcomeEmail } from "@/lib/sending";
+import { startSequences } from "@/lib/sequences";
 import { normalizeEmail } from "@/lib/validation";
 
 const PER_IP = { name: "subscribe-ip", limit: 5, window: "10 m" };
@@ -57,6 +58,11 @@ export async function subscribe(_state, formData) {
 			queue({ newsletter, contact }).catch((error) =>
 				console.error(`[subscribe] Signup email for ${contact._id} failed:`, error.message)
 			)
+		);
+	}
+	if (created && contact.status === "active") {
+		after(() =>
+			startSequences({ newsletter, contact }).catch((error) => console.error(`[subscribe] Sequences for ${contact._id} failed:`, error.message))
 		);
 	}
 	if (!isPending) return { ok: true };

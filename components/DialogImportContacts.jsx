@@ -16,7 +16,7 @@ import {
 	DialogTrigger,
 } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { MAX_IMPORT_ROWS_PER_REQUEST, mapColumns, normalizeImportRow } from "@/lib/csv-import";
+import { MAX_IMPORT_ROWS_PER_REQUEST, mapColumns, mapFieldColumns, mapSourceColumn, normalizeImportRow } from "@/lib/csv-import";
 import { CONSENT_TEXT, DROP_REASONS, addDropped } from "@/lib/import-checks";
 import { formatNumber } from "@/lib/format";
 import { toast } from "@/lib/toast";
@@ -37,7 +37,7 @@ export default function DialogImportContacts({ newsletter, label = "Import", var
 	// Invalid rows still go to the server, which checks every row again and counts them in the import.
 	const { rows, invalidRows, duplicates } = useMemo(() => {
 		if (!parsed) return { rows: [], invalidRows: [], duplicates: 0 };
-		const options = mode === "dormant" ? { status: "dormant" } : {};
+		const options = { ...(mode === "dormant" && { status: "dormant" }), fieldColumns: parsed.fieldColumns, sourceColumn: parsed.sourceColumn };
 		const byEmail = new Map();
 		const invalid = [];
 		for (const row of parsed.rows) {
@@ -82,7 +82,8 @@ export default function DialogImportContacts({ newsletter, label = "Import", var
 					toast.error("No email column found");
 					return reset();
 				}
-				setParsed({ rows: data, columns });
+				const headers = meta.fields ?? [];
+				setParsed({ rows: data, columns, fieldColumns: mapFieldColumns(headers), sourceColumn: mapSourceColumn(headers) });
 			},
 			error: () => toast.error("Could not read this file"),
 		});

@@ -10,6 +10,8 @@ const contactSchema = new mongoose.Schema(
 		email: { type: String, required: true, lowercase: true, trim: true },
 		status: { type: String, enum: CONTACT_STATUSES, default: "active" },
 		source: { type: String, trim: true },
+		// Custom fields (lib/contact-fields.js): first_name, sun_sign… for merge tags, audiences and sequence variants.
+		fields: { type: Map, of: String, default: undefined },
 		importId: { type: mongoose.Schema.Types.ObjectId, ref: "ContactImport" },
 		// Added by hand on the dashboard: the user who said this person agreed to get the newsletter, and when.
 		consent: {

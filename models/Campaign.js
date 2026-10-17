@@ -24,6 +24,9 @@ const campaignSchema = new mongoose.Schema(
 		ratesAcceptedAt: { type: Date },
 		// Warm-up: send to the most engaged contacts first, capped at audienceLimit.
 		audienceLimit: { type: Number, min: 1 },
+		// Only contacts whose fields match: each field name to the values it accepts, null for a missing field
+		// (lib/contact-fields.js).
+		audienceFields: { type: mongoose.Schema.Types.Mixed, default: undefined },
 		// Contacts never mailed before go out in steps: a first slice, a check, then the rest (lib/first-send.js), over
 		// restHours in a spread send.
 		firstSend: {

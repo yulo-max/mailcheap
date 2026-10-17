@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import mongoose from "mongoose";
 import Papa from "papaparse";
 import { createConfirmToken } from "../lib/confirmation.js";
 import { mapFieldColumns } from "../lib/csv-import.js";
 import { isQuietTime } from "../lib/sequence-rules.js";
+import { readMeta, readSequenceFolder, stripMetaComment } from "../scripts/import-sequence.mjs";
 import { activate, anonymous, as, callApi, catchRedirect, form, jsonRequest, signIn, startTestApp, withEnv } from "./helpers/app.mjs";
 import { flushAfter } from "./stubs/next-server.mjs";
 import { published } from "./stubs/qstash.mjs";
@@ -584,6 +588,56 @@ describe("sequences", () => {
 		);
 		assert.match(assertError(await api(user.key, "PATCH", `/sequences/${big.id}`, { status: "active" }), 422, "send_check_failed"), /Step 1, variant 1: The email is \d+ KB/);
 		assert.equal((await ok(api(user.key, "GET", `/sequences/${big.id}`))).status, "draft");
+	});
+
+	test("scripts/import-sequence.mjs reads a folder of variants into steps the API loads", async () => {
+		const draft = (day, subject) => `<!DOCTYPE html>
+<html><head><title>{{subject}}</title>
+<!-- Welcome mail, DRAFT ONLY.
+     Send: day ${day} after opt-in. Subject: ${subject}
+     Preview text: A short note for {{first_name|you}}. -->
+</head><body><p>Hello {{first_name|there}}, ${subject}</p><a href="{{unsubscribe_url}}">Unsubscribe</a></body></html>`;
+		assert.deepEqual(readMeta(draft(3, "Scorpio: day three")), { subject: "Scorpio: day three", previewText: "A short note for {{first_name|you}}.", dayOffset: 3 });
+		assert.ok(!stripMetaComment(draft(3, "x")).includes("DRAFT ONLY"), "the notes stay out of the email");
+
+		const folder = await mkdtemp(join(tmpdir(), "mailcheap-sequence-"));
+		try {
+			for (const sign of ["scorpio", "leo"]) {
+				await writeFile(join(folder, `welcome-01-${sign}.html`), draft(0, "Your result, saved"));
+				await writeFile(join(folder, `welcome-02-${sign}.html`), draft(1, `${sign}: what your sign describes`));
+			}
+			await writeFile(join(folder, "welcome-02-default.html"), draft(1, "What your sign describes"));
+			await writeFile(join(folder, "notes.md"), "Not an email.");
+			const plan = await readSequenceFolder(folder);
+			assert.deepEqual(
+				plan.steps.map(({ position, dayOffset, variants }) => [position, dayOffset, variants.map(({ match }) => match?.sun_sign ?? "fallback")]),
+				[
+					[1, 0, ["leo", "scorpio"]],
+					[2, 1, ["fallback", "leo", "scorpio"]],
+				]
+			);
+			assert.deepEqual(plan.warnings, ["Step 1: no fallback (…-01-default.html), so contacts without a matching sun_sign skip it"]);
+			await assert.rejects(readSequenceFolder(folder, { days: [0] }), /--days has 1 offsets for 2 steps/);
+
+			// What the script sends, one call per step.
+			const user = await customer("import-script@example.com");
+			const sequence = await ok(api(user.key, "POST", "/sequences", { name: "Imported" }), 201);
+			for (const step of plan.steps) {
+				const variants = step.variants.map(({ file, ...rest }) => rest);
+				await ok(api(user.key, "POST", `/sequences/${sequence.id}/steps`, { position: step.position, dayOffset: step.dayOffset, variants }));
+			}
+			await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+			await signUp(user, "mira@import-script.example.org", { first_name: "Mira", sun_sign: "scorpio" });
+			await flushAfter();
+			await runDue(0);
+			await runDue(1);
+			const received = emailsTo("mira@import-script.example.org");
+			assert.deepEqual(received.map(({ subject }) => subject), ["Your result, saved", "scorpio: what your sign describes"]);
+			assert.match(received[1].html, /Hello Mira, scorpio/);
+			assert.ok(!received[1].html.includes("DRAFT ONLY"));
+		} finally {
+			await rm(folder, { recursive: true, force: true });
+		}
 	});
 
 	test("the cron route runs only with CRON_SECRET", async () => {

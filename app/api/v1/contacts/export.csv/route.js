@@ -1,6 +1,7 @@
 import { scoped } from "@/lib/account-scope";
 import { ERROR_CODES, hasActiveSubscription } from "@/lib/account-state";
 import { contactSearchFilter } from "@/lib/contacts";
+import { MAX_FIELDS } from "@/lib/contact-fields";
 import { getCsvHeader, toCsvRow } from "@/lib/contacts-csv";
 import { connectDb } from "@/lib/db";
 import { verifyExportToken } from "@/lib/export-token";
@@ -9,6 +10,8 @@ import Contact from "@/models/Contact";
 import Newsletter from "@/models/Newsletter";
 
 const ROWS_PER_CHUNK = 500;
+// Columns for custom fields, as many as a contact can have.
+const MAX_FIELD_COLUMNS = MAX_FIELDS * 2;
 
 function fail(status, code, message) {
 	return Response.json({ error: { code, message } }, { status });
@@ -29,13 +32,23 @@ export async function GET(request) {
 		...contactSearchFilter(account, { newsletterId: link.newsletterId, query: link.query }),
 		...(link.status && { status: link.status }),
 	};
+	const fieldKeys = (
+		await Contact.aggregate([
+			{ $match: filter },
+			{ $project: { field: { $objectToArray: { $ifNull: ["$fields", {}] } } } },
+			{ $unwind: "$field" },
+			{ $group: { _id: "$field.k" } },
+			{ $sort: { _id: 1 } },
+			{ $limit: MAX_FIELD_COLUMNS },
+		])
+	).map(({ _id }) => _id);
 	const cursor = Contact.find(filter).sort({ subscribedAt: -1, _id: -1 }).lean().cursor();
 	const encoder = new TextEncoder();
 	let isStarted = false;
 
 	const stream = new ReadableStream({
 		async pull(controller) {
-			let chunk = isStarted ? "" : getCsvHeader();
+			let chunk = isStarted ? "" : getCsvHeader(fieldKeys);
 			isStarted = true;
 			for (let count = 0; count < ROWS_PER_CHUNK; count += 1) {
 				const contact = await cursor.next();
@@ -45,7 +58,7 @@ export async function GET(request) {
 					await cursor.close();
 					return;
 				}
-				chunk += toCsvRow(contact, newsletters);
+				chunk += toCsvRow(contact, newsletters, fieldKeys);
 			}
 			controller.enqueue(encoder.encode(chunk));
 		},

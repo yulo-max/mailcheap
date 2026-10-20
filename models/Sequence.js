@@ -17,9 +17,13 @@ const variantSchema = new mongoose.Schema({
 	html: { type: String, default: "" },
 });
 
-// dayOffset: days after the contact joined (signup, or confirmation when the newsletter asks for one).
+// dayOffset: days after the contact joined (signup, or confirmation when the newsletter asks for one). lateLimitHours:
+// a contact the step reaches more than that after it was due skips it. skipAfterField: a contact field holding a time
+// (unix seconds or ISO 8601); a contact whose time has passed skips the step.
 const stepSchema = new mongoose.Schema({
 	dayOffset: { type: Number, min: 0, required: true },
+	lateLimitHours: { type: Number, min: 1, max: 8760 },
+	skipAfterField: { type: String },
 	variants: { type: [variantSchema], default: [] },
 });
 
@@ -29,6 +33,8 @@ const sequenceSchema = new mongoose.Schema(
 		name: { type: String, trim: true, required: true },
 		status: { type: String, enum: SEQUENCE_STATUSES, default: "draft" },
 		steps: { type: [stepSchema], default: [] },
+		// Hours a contact waits at least between two of its steps, late or not.
+		minHoursBetweenSteps: { type: Number, min: 0, max: 168, default: 0 },
 	},
 	{ timestamps: true }
 );

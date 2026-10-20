@@ -20,9 +20,42 @@ Replacing a step keeps its ID (`set_sequence_step` at a position, or `update_seq
 - The first step, when it's due at once, goes from the signup itself, like a welcome email.
 - A cron calls `/api/cron/sequences` every 15 minutes and queues every step that came due, as send batches through QStash, like a campaign's. Self-hosted: see the README's **Sequences** entry under Optional.
 - **Quiet hours**: nothing is due between 03:00 and 06:00 Europe/Amsterdam time. A step due then moves to 06:00, and a run in those hours does nothing. Clock changes are taken into account.
-- **Late steps keep their spacing**: when a step goes out late (a paused sequence, a blocked account), the next waits as long after it as their offsets are apart, so steps never arrive together.
+- **Late steps keep their spacing**: when a step goes out late (a paused sequence, a blocked account, sending off), the next waits as long after it as their offsets are apart, so steps never arrive together. Steps that shouldn't go late can be skipped instead: see [Late and time-limited steps](#late-and-time-limited-steps).
 - **Limits**: steps count toward the plan's emails like welcome emails. Once the month's emails are used up they're skipped, not sent later, and the owner hears once a month. On MailCheap Cloud a run sends what the account's warm-up pace allows at full speed, 50 at least, and leaves the rest for the next run. A blocked account or one without a plan sends nothing; its steps wait.
 - **Pausing** (`update_sequence` with `"status": "paused"`) holds every contact where they are and takes nobody new. Making it active again sends the steps that came due since, spaced out.
+
+### Late and time-limited steps
+
+By default a step goes however late it is. Three settings change that, each left out unless set:
+
+- **`lateLimitHours`** (a step's, 1 to 8760): a contact the step reaches more than that many hours after it was due skips it. Due is when the step would have gone: its `dayOffset` after joining, or later to keep its spacing after the step before.
+- **`skipAfterField`** (a step's): the name of a custom field holding the contact's own deadline, as unix seconds (`1798761600`) or an ISO 8601 date (`2026-12-31T23:00:00Z`). A contact whose time has passed when the step is due skips it. A contact without the field, or with a value that isn't one of those, gets the step as usual.
+- **`minHoursBetweenSteps`** (the sequence's, 0 to 168, 0 by default): a contact's steps are at least that many hours apart, even when their offsets are closer or the step before went late. It counts from the step before, so a change applies from each contact's next step on.
+
+A skipped step sends nothing and the contact goes on to the next. When that one is due already, the same run looks at it too: after a long stop, a contact skips every step that's too late and gets the first one that isn't, one email per run at most. Skipping the last step completes the sequence. A step already queued for a contact when a run stopped halfway still goes, however late. Each contact's skipped steps are counted on its place in the sequence (`skippedSteps`), and each run reports how many it skipped.
+
+A day-5 offer that ends 24 hours after it's sent, for contacts whose quiz sets `offer_expires_ts`, with at least a day between any two emails:
+
+```json
+{
+  "name": "Welcome series",
+  "minHoursBetweenSteps": 24,
+  "steps": [
+    { "dayOffset": 0, "variants": [{ "subject": "Welcome, {{first_name|friend}}", "content": "<html>…</html>" }] },
+    { "dayOffset": 2, "variants": [{ "subject": "What your sign describes", "content": "<html>…</html>" }] },
+    {
+      "dayOffset": 5,
+      "lateLimitHours": 24,
+      "skipAfterField": "offer_expires_ts",
+      "variants": [{ "subject": "Your personal offer ends at {{offer_ends}}", "content": "<html>…</html>" }]
+    }
+  ]
+}
+```
+
+If sending stops on day 4 and starts again on day 7, the offer step is more than 24 hours late and nobody gets it; a contact whose `offer_expires_ts` passed on day 5 skips it even when everything runs on time.
+
+`set_sequence_step` and `update_sequence` replace a step with what they're sent: send `lateLimitHours` and `skipAfterField` again to keep them. `scripts/import-sequence.mjs --sequence` keeps the ones the steps already have.
 
 ## API and MCP
 

@@ -17,6 +17,8 @@ const enrollmentSchema = new mongoose.Schema(
 		nextAt: { type: Date },
 		// When the last step was queued: a late step keeps its distance to the next.
 		lastQueuedAt: { type: Date },
+		// Steps the contact skipped: reached too late, or past the contact's own time (models/Sequence.js).
+		skippedSteps: { type: Number, default: 0 },
 		stoppedReason: { type: String },
 		endedAt: { type: Date },
 	},

@@ -155,7 +155,13 @@ async function main() {
 	console.log(`${options.sequence ? "Updating" : "Created"} sequence ${sequence.id} (${sequence.status})`);
 	for (const step of plan.steps) {
 		const variants = step.variants.map(({ file, ...variant }) => variant);
-		await call(baseUrl, key, "POST", `/sequences/${sequence.id}/steps`, { position: step.position, dayOffset: step.dayOffset, variants });
+		// A replaced step loses the settings it isn't sent: the late limit and deadline field set through the API stay.
+		const previous = sequence.steps?.[step.position - 1];
+		const settings = {
+			...(previous?.lateLimitHours && { lateLimitHours: previous.lateLimitHours }),
+			...(previous?.skipAfterField && { skipAfterField: previous.skipAfterField }),
+		};
+		await call(baseUrl, key, "POST", `/sequences/${sequence.id}/steps`, { position: step.position, dayOffset: step.dayOffset, ...settings, variants });
 		console.log(`Step ${step.position} saved`);
 	}
 	if (sequence.steps?.length > plan.steps.length) {

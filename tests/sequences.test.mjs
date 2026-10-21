@@ -78,6 +78,13 @@ function runAt(days) {
 	return time;
 }
 
+// A run just after a given time, out of the quiet hours.
+function runAtTime(date) {
+	let time = new Date(date.getTime() + 60_000);
+	while (isQuietTime(time)) time = new Date(time.getTime() + HOUR_MS);
+	return time;
+}
+
 async function runDue(days) {
 	const result = await m.sequences.runDueSequenceSteps({ now: runAt(days) });
 	await runJobs();
@@ -638,6 +645,236 @@ describe("sequences", () => {
 		} finally {
 			await rm(folder, { recursive: true, force: true });
 		}
+	});
+
+	test("after 6 days with sending off, steps past their lateLimitHours are skipped and the first still in time goes", async () => {
+		const user = await customer("late-limit@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Late limits",
+				steps: [
+					{ dayOffset: 1, lateLimitHours: 24, variants: [variant("Day 1", "Hi.")] },
+					{ dayOffset: 3, lateLimitHours: 24, variants: [variant("Day 3", "Hi.")] },
+					{ dayOffset: 5, lateLimitHours: 48, variants: [variant("Day 5", "Hi.")] },
+					{ dayOffset: 8, lateLimitHours: 24, variants: [variant("Day 8", "Hi.")] },
+				],
+			}),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const ada = await signUp(user, "ada@late-limit.example.org");
+		await flushAfter();
+		const enrollment = () => m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: ada.id }).lean();
+		const messages = () => m.Message.countDocuments({ accountId: user.accountId, kind: "sequence", contactId: ada.id });
+
+		await withEnv({ SENDING_ENABLED: "false" }, async () => {
+			for (const day of [1, 3, 5]) assert.deepEqual(await m.sequences.runDueSequenceSteps({ now: runAt(day) }), { skipped: "sending is off" });
+		});
+		assert.equal((await enrollment()).step, 0, "nothing moves while sending is off");
+
+		// Day 1 and day 3 are days late; day 5 is about a day late, inside its 48 hours.
+		const result = await runDue(6);
+		assert.ok(result.skipped >= 2, JSON.stringify(result));
+		assert.deepEqual(emailsTo("ada@late-limit.example.org").map(({ subject }) => subject), ["Day 5"]);
+		assert.equal(await messages(), 1, "one step per run");
+		const waiting = await enrollment();
+		assert.equal(waiting.step, 3);
+		assert.equal(waiting.skippedSteps, 2);
+		assert.ok(waiting.nextAt.getTime() - waiting.lastQueuedAt.getTime() >= 3 * DAY_MS, "day 8 keeps its 3 days after day 5");
+
+		await runDue(6);
+		assert.equal(await messages(), 1);
+		await m.sequences.runDueSequenceSteps({ now: runAtTime(waiting.nextAt) });
+		await runJobs();
+		assert.deepEqual(emailsTo("ada@late-limit.example.org").map(({ subject }) => subject), ["Day 5", "Day 8"]);
+		const done = await enrollment();
+		assert.equal(done.status, "completed");
+		assert.equal(done.skippedSteps, 2);
+	});
+
+	test("a step a run stopped after queueing still goes, even past its lateLimitHours", async () => {
+		const user = await customer("late-resume@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Resume",
+				steps: [
+					{ dayOffset: 1, lateLimitHours: 24, variants: [variant("Day 1", "Hi.")] },
+					{ dayOffset: 3, variants: [variant("Day 3", "Hi.")] },
+				],
+			}),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const ada = await signUp(user, "ada@late-resume.example.org");
+		await flushAfter();
+		// What a run leaves when it stops after the step's record and before the enrollment moves on.
+		const [step] = (await m.Sequence.findOne({ accountId: user.accountId, _id: sequence.id }).lean()).steps;
+		const message = await m.Message.create({
+			accountId: user.accountId,
+			newsletterId: user.newsletterId,
+			kind: "sequence",
+			sequenceId: sequence.id,
+			stepId: step._id,
+			variantId: step.variants[0]._id,
+			contactId: ada.id,
+			email: "ada@late-resume.example.org",
+			status: "queued",
+		});
+
+		// Day 1 is two days late, past its 24 hours.
+		const result = await runDue(3);
+		assert.equal(result.skipped, 0, JSON.stringify(result));
+		assert.deepEqual(emailsTo("ada@late-resume.example.org").map(({ subject }) => subject), ["Day 1"]);
+		assert.equal((await m.Message.findOne({ accountId: user.accountId, _id: message._id }).lean()).status, "sent");
+		assert.equal(await m.Message.countDocuments({ accountId: user.accountId, kind: "sequence", contactId: ada.id }), 1);
+		const enrollment = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: ada.id }).lean();
+		assert.equal(enrollment.step, 1);
+		assert.equal(enrollment.skippedSteps, 0);
+	});
+
+	test("a step with skipAfterField is skipped by contacts whose time has passed, and goes to the others", async () => {
+		const user = await customer("offer@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Offer",
+				steps: [
+					{ dayOffset: 0, variants: [variant("Welcome", "Hi.")] },
+					{ dayOffset: 1, skipAfterField: "offer_expires_ts", variants: [variant("Your offer ends at {{offer_ends|soon}}", "Hi.")] },
+					{ dayOffset: 2, variants: [variant("Last", "Hi.")] },
+				],
+			}),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const seconds = (days) => Math.floor((Date.now() + days * DAY_MS) / 1000);
+		const past = await signUp(user, "past@offer.example.org", { offer_expires_ts: seconds(0.5) });
+		await signUp(user, "future@offer.example.org", { offer_expires_ts: new Date(Date.now() + 3 * DAY_MS).toISOString() });
+		await signUp(user, "missing@offer.example.org");
+		await flushAfter();
+		await runDue(0);
+
+		const result = await runDue(1);
+		assert.ok(result.skipped >= 1, JSON.stringify(result));
+		const subjects = (address) => emailsTo(address).map(({ subject }) => subject);
+		assert.deepEqual(subjects("past@offer.example.org"), ["Welcome"]);
+		assert.deepEqual(subjects("future@offer.example.org"), ["Welcome", "Your offer ends at soon"]);
+		assert.deepEqual(subjects("missing@offer.example.org"), ["Welcome", "Your offer ends at soon"], "no field: the step goes");
+		const skipped = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: past.id }).lean();
+		assert.equal(skipped.step, 2);
+		assert.equal(skipped.skippedSteps, 1);
+		assert.ok(skipped.nextAt > runAt(1), "the next step waits for its day");
+
+		await runDue(2);
+		assert.deepEqual(subjects("past@offer.example.org"), ["Welcome", "Last"]);
+		assert.deepEqual(subjects("future@offer.example.org").at(-1), "Last");
+		assert.equal(await m.SequenceEnrollment.countDocuments({ accountId: user.accountId, status: "completed" }), 3);
+	});
+
+	test("minHoursBetweenSteps holds the next step back, even when the offsets are the same", async () => {
+		const user = await customer("min-hours@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "A day apart",
+				minHoursBetweenSteps: 24,
+				steps: [0, 0].map((dayOffset, index) => ({ dayOffset, variants: [variant(`Step ${index + 1}`, "Hi.")] })),
+			}),
+			201
+		);
+		assert.equal(sequence.minHoursBetweenSteps, 24);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const kai = await signUp(user, "kai@min-hours.example.org");
+		await flushAfter();
+		await runDue(0);
+		await runDue(0);
+		assert.deepEqual(emailsTo("kai@min-hours.example.org").map(({ subject }) => subject), ["Step 1"]);
+		const enrollment = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: kai.id }).lean();
+		assert.ok(enrollment.nextAt.getTime() - enrollment.lastQueuedAt.getTime() >= 24 * HOUR_MS);
+
+		await m.sequences.runDueSequenceSteps({ now: runAtTime(enrollment.nextAt) });
+		await runJobs();
+		assert.deepEqual(emailsTo("kai@min-hours.example.org").map(({ subject }) => subject), ["Step 1", "Step 2"]);
+	});
+
+	test("without the settings, a late step still goes", async () => {
+		const user = await customer("still-late@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", { name: "Late", steps: [0, 2].map((dayOffset) => ({ dayOffset, variants: [variant(`Day ${dayOffset}`, "Hi.")] })) }),
+			201
+		);
+		assert.equal(sequence.minHoursBetweenSteps, 0);
+		assert.deepEqual(sequence.steps.map(({ lateLimitHours, skipAfterField }) => [lateLimitHours, skipAfterField]), [
+			[null, null],
+			[null, null],
+		]);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const lou = await signUp(user, "lou@still-late.example.org");
+		await flushAfter();
+		await runDue(0);
+		await withEnv({ SENDING_ENABLED: "false" }, () => m.sequences.runDueSequenceSteps({ now: runAt(2) }));
+		await runDue(8);
+		assert.deepEqual(emailsTo("lou@still-late.example.org").map(({ subject }) => subject), ["Day 0", "Day 2"]);
+		const enrollment = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: lou.id }).lean();
+		assert.equal(enrollment.status, "completed");
+		assert.equal(enrollment.skippedSteps, 0);
+	});
+
+	test("the API and MCP save and return lateLimitHours, skipAfterField and minHoursBetweenSteps, and refuse bad values", async () => {
+		const user = await customer("late-settings@example.com");
+		const settings = (sequence) => [sequence.minHoursBetweenSteps, sequence.steps.map(({ lateLimitHours, skipAfterField }) => [lateLimitHours, skipAfterField])];
+		const created = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Offer",
+				minHoursBetweenSteps: 12,
+				steps: [
+					{ dayOffset: 0, variants: [variant("Welcome", "Hi.")] },
+					{ dayOffset: 5, lateLimitHours: 24, skipAfterField: "offer_expires_ts", variants: [variant("Offer", "Hi.")] },
+				],
+			}),
+			201
+		);
+		const expected = [12, [[null, null], [24, "offer_expires_ts"]]];
+		assert.deepEqual(settings(created), expected);
+		assert.deepEqual(settings(await ok(api(user.key, "GET", `/sequences/${created.id}`))), expected);
+		assert.deepEqual(settings((await ok(api(user.key, "GET", "/sequences"))).sequences[0]), expected, "lists have them too");
+		assert.deepEqual(settings(await callTool(user.key, "get_sequence", { id: created.id })), expected);
+
+		const [first, offer] = created.steps;
+		const updated = await ok(
+			api(user.key, "PATCH", `/sequences/${created.id}`, {
+				minHoursBetweenSteps: 0,
+				steps: [
+					{ id: first.id, dayOffset: 0, lateLimitHours: 6, variants: [variant("Welcome", "Hi.")] },
+					{ id: offer.id, dayOffset: 5, lateLimitHours: 48, variants: [variant("Offer", "Hi.")] },
+				],
+			})
+		);
+		assert.deepEqual(settings(updated), [0, [[6, null], [48, null]]]);
+		assert.equal(updated.steps[1].id, offer.id);
+		const renamed = await ok(api(user.key, "PATCH", `/sequences/${created.id}`, { name: "Renamed" }));
+		assert.deepEqual(settings(renamed), [0, [[6, null], [48, null]]], "left out: unchanged");
+		const replaced = await callTool(user.key, "set_sequence_step", { id: created.id, position: 2, dayOffset: 5, skipAfterField: "offer_ends_at", variants: [variant("Offer", "Hi.")] });
+		assert.deepEqual(settings(replaced), [0, [[6, null], [null, "offer_ends_at"]]], "a replaced step takes what it's sent");
+
+		const step = (extra) => ({ name: "Bad", steps: [{ dayOffset: 0, ...extra, variants: [variant("Hi", "Hi.")] }] });
+		for (const body of [
+			step({ lateLimitHours: 0 }),
+			step({ lateLimitHours: 1.5 }),
+			step({ lateLimitHours: 8761 }),
+			step({ skipAfterField: "Offer Ends" }),
+			step({ skipAfterField: "email" }),
+			{ name: "Bad", minHoursBetweenSteps: 200 },
+			{ name: "Bad", minHoursBetweenSteps: -1 },
+		]) {
+			assertError(await api(user.key, "POST", "/sequences", body), 400, "validation_failed");
+		}
+		assertError(await api(user.key, "PATCH", `/sequences/${created.id}`, { minHoursBetweenSteps: 200 }), 400, "validation_failed");
+		assertError(
+			await api(user.key, "POST", `/sequences/${created.id}/steps`, { position: 2, dayOffset: 5, lateLimitHours: 0, variants: [variant("Offer", "Hi.")] }),
+			400,
+			"validation_failed"
+		);
+		assert.equal(await m.Sequence.countDocuments({ accountId: user.accountId }), 1, "nothing saved");
+		assert.deepEqual(settings(await ok(api(user.key, "GET", `/sequences/${created.id}`))), [0, [[6, null], [null, "offer_ends_at"]]]);
 	});
 
 	test("the cron route runs only with CRON_SECRET", async () => {

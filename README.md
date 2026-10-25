@@ -28,7 +28,7 @@
 
 ![MailCheap's overview: emails sent, delivery, open, click, bounce and complaint rates, and subscribers over the last 30 days](docs/screenshots/overview.webp)
 
-MailCheap is a newsletter app: write an issue, send it to your list, publish it on the web, from the dashboard or from your AI agent. This repository is the whole app. Self-host it with your own Amazon SES or PostShiba account, or use [MailCheap Cloud](https://mailcheap.ai), which runs this same code.
+MailCheap is a newsletter app: write an issue, send it to your list, publish it on the web, from the dashboard or from your AI agent. This repository is the whole app. Self-host it with your own Amazon SES, PostShiba or Resend account, or use [MailCheap Cloud](https://mailcheap.ai), which runs this same code.
 
 ## Features
 
@@ -60,7 +60,7 @@ All names and addresses in the screenshots are made up.
 | | [MailCheap Cloud](https://mailcheap.ai) | Self-hosted |
 | --- | --- | --- |
 | Price | From $19 a month for 20,000 emails | Free, plus what your provider charges per email: $0.10 to $0.16 per 1,000 on Amazon SES |
-| Sending | Set up for you, from `hello@<slug>.mailcheap.ai` or your domain | Your Amazon SES or PostShiba account, from your domain |
+| Sending | Set up for you, from `hello@<slug>.mailcheap.ai` or your domain | Your Amazon SES, PostShiba or Resend account, from your domain |
 | Website | `<slug>.mailcheap.ai` | `/archive/<slug>` on your server's domain |
 | Who signs in | Anyone who signs up | The emails you allow |
 | Limits | Emails a month and active subscribers, by plan | None |
@@ -85,7 +85,7 @@ Plan for about an hour, most of it waiting for DNS and for your provider to appr
 | [Amazon SES](https://aws.amazon.com/ses/) or [PostShiba](https://postshiba.com) | Sending | SES: $0.10 to $0.16 per 1,000 emails, depending on its pricing plan. PostShiba: a fixed price per cluster, invite only for now |
 | [Upstash QStash](https://upstash.com/docs/qstash) | Background sending and scheduling | Free tier to start, then pay per message. One message sends 50 emails |
 | [Vercel](https://vercel.com) or any Node.js 22+ host | Hosting | Free tier works |
-| [Resend](https://resend.com) (optional) | Sign-in codes and alerts. Without it, they go through SES or PostShiba | Free plan works |
+| [Resend](https://resend.com) (optional) | Sign-in codes and alerts, or all sending with `EMAIL_PROVIDER=resend` | Free plan: 100 emails a day |
 | [Upstash Redis](https://upstash.com/docs/redis) (optional) | Rate limits shared by every server instance | Free tier |
 | [Amazon S3](https://aws.amazon.com/s3/) with [CloudFront](https://aws.amazon.com/cloudfront/), or [Vercel Blob](https://vercel.com/docs/vercel-blob) (optional) | Image uploads in the editor, the newsletter settings and the API | S3 and CloudFront: pay per use. Blob: free tier |
 
@@ -135,7 +135,7 @@ Everyone gets an account of their own, with up to 3 newsletters and their contac
 
 ### 4. Email provider
 
-Pick Amazon SES or PostShiba (invite only for now). `EMAIL_PROVIDER` picks one; without it, MailCheap uses PostShiba when `POSTSHIBA_API_KEY` is set and SES otherwise. Every account gets its own tenant there, with its own domains, suppression list and pause switch. MailCheap creates them; you set up the provider account and its events once.
+Pick Amazon SES, PostShiba (invite only for now) or Resend. `EMAIL_PROVIDER` picks one; without it, MailCheap uses PostShiba when `POSTSHIBA_API_KEY` is set and SES otherwise. `RESEND_API_KEY` on its own only sends MailCheap's own emails (sign-in codes and alerts). Set `EMAIL_PROVIDER=resend` to send readers' emails through Resend too. On SES and PostShiba, every account gets its own tenant, with its own domains, suppression list and pause switch. MailCheap creates them; you set up the provider account and its events once.
 
 #### Amazon SES
 
@@ -193,6 +193,18 @@ PostShiba approves production sending by hand: until then, sends to anyone outsi
 MailCheap creates the rest: a tenant per account (slug `mc-<accountId>`), an SMTP credential for it on each cluster (one in all on a single cluster), and its domains. Creating credentials and domains and running domain checks share PostShiba's budget of 60 an hour per key; a failed setup is retried at the account's next send.
 
 Without Resend, sign-in codes and alerts go through a tenant of their own, `mc-platform`, on the transactional cluster. The first one adds `EMAIL_FROM`'s domain there, and the server log lists the two CNAME records it needs; once PostShiba finds them, codes go out. A domain belongs to one tenant at PostShiba, so `EMAIL_FROM` needs a domain or subdomain that no newsletter sends from.
+
+#### Resend
+
+Resend can send readers' emails as well as sign-in codes. One Resend account sends for every MailCheap account on the server: each customer's domain is added there, and bounces and complaints come back with the account and message id MailCheap put on the email. Sending stays off until step 6.
+
+1. **Key.** `RESEND_API_KEY`, with access to send and to manage domains. The free plan is 100 emails a day and about 2 requests a second. Past the daily quota, Resend answers that the quota is used up: the batch waits and is tried again, at most once an hour, until it resets at midnight UTC.
+2. **Webhook.** Add an endpoint at `https://<your-app>/api/webhooks/resend` for `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.bounced`, `email.complained`, `email.failed` and `email.suppressed`. Opens and clicks are optional: MailCheap counts its own. Put the signing secret (`whsec_…`) in `RESEND_WEBHOOK_SECRET`. Without it, the endpoint answers 503 and bounces are not suppressed.
+3. **Switch.** Set `EMAIL_PROVIDER=resend` and redeploy. Optional: `RESEND_SEND_RATE_PER_SECOND` (default 2, up to 100) once Resend raises the rate.
+
+MailCheap adds each new domain with return path `bounce.<domain>` and turns Resend's open and click tracking off. A domain already on the Resend account is reused and keeps the return path it has. Add the DNS records the Domains page lists, then click **Check now**. Use a subdomain such as `mail.example.com` for the newsletter when `EMAIL_FROM` already uses the root domain: removing the domain in MailCheap removes it at Resend.
+
+Sign-in codes use the same key and don't wait for `EMAIL_PROVIDER` or `SENDING_ENABLED`.
 
 ### 5. QStash
 
@@ -327,7 +339,7 @@ npm run dev
 - Without `MAILCHEAP_CLOUD` it runs as a self-hosted server: sign in with an email in `ADMIN_EMAILS` or `ALLOWED_EMAILS`. Without `RESEND_API_KEY`, development prints the code in the server console (`[signin] Code for ...`); production never does.
 - A local MongoDB works: `docker run -d -p 27017:27017 mongo` and `MONGODB_URI=mongodb://127.0.0.1:27017/mailcheap`. A replica set (`mongod --replSet rs0`, then `rs.initiate()`) also gives Better Auth transactions, like Atlas.
 - To work on MailCheap Cloud's own parts, set `MAILCHEAP_CLOUD=true` with Stripe test keys and a Resend key: the cloud doesn't start without them. Run `stripe listen --forward-to localhost:3000/api/webhooks/stripe` and use its signing secret as `STRIPE_WEBHOOK_SECRET`.
-- Sending stays off unless `SENDING_ENABLED=true`. SES needs `SES_ACCESS_KEY_ID` and `SES_SECRET_ACCESS_KEY`: the app never falls back to `~/.aws` or other default AWS credentials. PostShiba needs its four ids and keys and `CREDENTIALS_ENCRYPTION_KEY`.
+- Sending stays off unless `SENDING_ENABLED=true`. SES needs `SES_ACCESS_KEY_ID` and `SES_SECRET_ACCESS_KEY`: the app never falls back to `~/.aws` or other default AWS credentials. PostShiba needs its four ids and keys and `CREDENTIALS_ENCRYPTION_KEY`. Resend needs `EMAIL_PROVIDER=resend`, `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.
 - QStash can't reach `localhost`. To try a full send locally, run the QStash dev server (`npx @upstash/qstash-cli dev`) and use the URL, token and signing keys it prints.
 
 Before a pull request, run the full suite, lint and a build:

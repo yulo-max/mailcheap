@@ -73,6 +73,13 @@ const accountSchema = new mongoose.Schema(
 				clusterId: { type: String },
 			},
 		},
+		// Resend has no tenant per account (lib/email-provider/resend.js): this only marks the account ready to
+		// send through the server's one Resend account. Domains stay the account's own.
+		resend: {
+			provisionedAt: { type: Date },
+			tenantStatus: { type: String },
+			tenantStatusAt: { type: Date },
+		},
 		// The last account-level check on recent sends.
 		health: {
 			checkedAt: { type: Date },

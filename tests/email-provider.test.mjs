@@ -11,6 +11,9 @@ test("PostShiba is the provider once its key is set, SES otherwise, and EMAIL_PR
 	assert.equal(getEmailProviderId({ POSTSHIBA_API_KEY: "ps_key", EMAIL_PROVIDER: "ses" }), "ses", "SES stays one switch away");
 	assert.equal(getEmailProviderId({ EMAIL_PROVIDER: " PostShiba " }), "postshiba");
 	assert.equal(getEmailProviderId({ EMAIL_PROVIDER: "mailgun", POSTSHIBA_API_KEY: "ps_key" }), null, "a typo never picks one");
+	assert.equal(getEmailProviderId({ EMAIL_PROVIDER: "resend", RESEND_API_KEY: "re_key" }), "resend");
+	assert.equal(getEmailProviderId({ RESEND_API_KEY: "re_key" }), "ses", "the key alone still sends sign-in codes, not campaigns");
+	assert.equal(getEmailProviderId({ RESEND_API_KEY: "re_key", POSTSHIBA_API_KEY: "ps_key" }), "postshiba");
 });
 
 test("provider outcomes become actions; SES errors keep theirs", () => {

@@ -16,7 +16,7 @@ Read this before working on MailCheap. If `AGENTS.cloud.md` is next to it (MailC
 
 MailCheap is a newsletter app: write an issue, send it to your list, publish it on the web. Everything the dashboard does also works from an AI agent, through a REST API and an MCP server.
 
-It's open source under the AGPL-3.0 (`LICENSE`): anyone can run it on their own server with their own Amazon SES or PostShiba account, change it and share it. The README is the self-hosting guide. MailCheap Cloud ([mailcheap.ai](https://mailcheap.ai)) runs this same code for people who'd rather not host it.
+It's open source under the AGPL-3.0 (`LICENSE`): anyone can run it on their own server with their own Amazon SES, PostShiba or Resend account, change it and share it. The README is the self-hosting guide. MailCheap Cloud ([mailcheap.ai](https://mailcheap.ai)) runs this same code for people who'd rather not host it.
 
 ## How it's organized
 
@@ -28,7 +28,7 @@ Next.js App Router in JavaScript, Tailwind CSS with shadcn/ui, MongoDB through M
 - **Accounts**: `scoped(account, filter)` (`lib/account-scope.js`) adds the account to every query, and a Mongoose plugin refuses customer queries without one. `requireAccount()` for pages and server actions, `authenticateRequest()` for the API and MCP (`lib/auth.js`, `lib/api-keys.js`).
 - **MCP and OAuth**: API keys, or OAuth access tokens from Better Auth's OAuth provider (`lib/auth.js`, `lib/oauth.js`, `lib/oauth-rules.js`), with the consent page at `app/oauth/consent`.
 - **Jobs**: QStash calls `app/api/jobs/*`: sending batches, scheduled sends, first-send checks and the purge of deleted accounts. A cron calls `app/api/cron/hourly` with `CRON_SECRET`: PostShiba's team status. Another calls `app/api/cron/postmaster` every day: Gmail's spam rates from Google Postmaster Tools (`lib/postmaster.js`), connected on `/admin`.
-- **Email providers**: `lib/email-provider` switches between `ses.js` and `postshiba.js` (tenants, domains, sends), and their events become one shape (`lib/email-event-rules.js`). MailCheap's own emails (sign-in codes, alerts) go through `lib/platform-email.js`: Resend, or the provider.
+- **Email providers**: `lib/email-provider` switches between `ses.js`, `postshiba.js` and `resend.js` (tenants, domains, sends), and their events become one shape (`lib/email-event-rules.js`). MailCheap's own emails (sign-in codes, alerts) go through `lib/platform-email.js`: Resend, or the provider. `RESEND_API_KEY` alone does not select Resend for readers' emails; `EMAIL_PROVIDER=resend` does.
 - **Alerts**: `sendAlert` (`lib/alerts.js`) emails an account's owner, or `ADMIN_EMAILS` for the admins'. `lib/alert-rules.js` says which admin alerts need someone; those go to Telegram too (`lib/telegram.js`) when it's set up. A new admin alert gets its kind there, or `tests/alerts.test.mjs` fails.
 - **Storage**: models in `models/`, images in S3 behind CloudFront or in Vercel Blob (`lib/image-storage.js`), rate limits in Upstash Redis or memory (`lib/rate-limit.js`).
 

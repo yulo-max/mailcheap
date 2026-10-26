@@ -6,7 +6,7 @@ A sequence is a series of emails each new subscriber gets on a schedule, like a 
 
 - **Steps** go in order. Each has a `dayOffset`: days after the contact joined, `0` for right away. Offsets can't go down from one step to the next; decimals work (`0.5` is 12 hours).
 - **Variants** are the versions of a step's email: a subject, a preview text and content (`html` by default, or `markdown` or `rich` as in campaigns). A variant's `match` says which contacts it's for, e.g. `{ "sun_sign": "scorpio" }` or `{ "sun_sign": ["leo", "aries"] }`. A variant without `match` is the step's fallback, for contacts no other variant matches; a step has one at most. A contact that matches no variant and has no fallback skips that step and goes on to the next.
-- **Who joins**: a contact joins every active sequence of its newsletter when it becomes active. That's at signup (`add_contact`, the archive's form, Add contact on the dashboard), or, when the newsletter asks new subscribers to confirm, when they click the confirmation link. Contacts from imports don't join, nor do contacts who were there before the sequence was active. A contact joins a sequence once, ever.
+- **Who joins**: a contact joins every active sequence of its newsletter when it becomes active. That's at signup (`add_contact`, the archive's form, Add contact on the dashboard), or, when the newsletter asks new subscribers to confirm, when they click the confirmation link. Active contacts who haven't joined (imported ones, those who were there before the sequence was active, or whose signup didn't get them in) join on the cron's next run, from when they confirmed or subscribed: the steps due since go out one per run, spaced like any late step. A contact joins a sequence once, ever.
 - **Who stops**: a contact who unsubscribes, bounces, complains or goes dormant leaves the sequence at its next step. A step queued just before they left is dropped when its batch runs.
 
 ### Once per step
@@ -18,7 +18,7 @@ Replacing a step keeps its ID (`set_sequence_step` at a position, or `update_seq
 ### When steps go out
 
 - The first step, when it's due at once, goes from the signup itself, like a welcome email.
-- A cron calls `/api/cron/sequences` every 15 minutes and queues every step that came due, as send batches through QStash, like a campaign's. Self-hosted: see the README's **Sequences** entry under Optional.
+- A cron calls `/api/cron/sequences` every 15 minutes: it takes in active contacts who haven't joined, brings back a `nextAt` set later than its step is due, and queues every step that came due, as send batches through QStash, like a campaign's. Self-hosted: see the README's **Sequences** entry under Optional.
 - **Quiet hours**: nothing is due between 03:00 and 06:00 Europe/Amsterdam time. A step due then moves to 06:00, and a run in those hours does nothing. Clock changes are taken into account.
 - **Late steps keep their spacing**: when a step goes out late (a paused sequence, a blocked account, sending off), the next waits as long after it as their offsets are apart, so steps never arrive together. Steps that shouldn't go late can be skipped instead: see [Late and time-limited steps](#late-and-time-limited-steps).
 - **Limits**: steps count toward the plan's emails like welcome emails. Once the month's emails are used up they're skipped, not sent later, and the owner hears once a month. On MailCheap Cloud a run sends what the account's warm-up pace allows at full speed, 50 at least, and leaves the rest for the next run. A blocked account or one without a plan sends nothing; its steps wait.
@@ -70,7 +70,7 @@ Every action is a REST endpoint under `/api/v1` and an MCP tool with the same na
 | `update_sequence` | `PATCH /sequences/{id}` | Name, all steps, or `status`: `active` or `paused` |
 | `delete_sequence` | `DELETE /sequences/{id}` | Deletes it and who's in it; steps queued and not sent don't go |
 
-Making a sequence active checks every variant like a send: the newsletter's from address and postal address, a subject, content, and Gmail's 100 KB clip. From then on, new subscribers join.
+Making a sequence active checks every variant like a send: the newsletter's from address and postal address, a subject, content, and Gmail's 100 KB clip. From then on, new subscribers join, and the cron's next run takes in the newsletter's active contacts already there.
 
 ```bash
 curl -X POST https://mail.example.com/api/v1/sequences \
@@ -145,7 +145,7 @@ To change the emails later, run the script with `--sequence <id>` instead of `--
 ## What it doesn't do yet
 
 - No dashboard pages: sequences are managed through the API, MCP and the script.
-- Contacts already on the list don't join a sequence made active later, and imported contacts never join.
+- Contacts already on the list, imported ones included, join a sequence made active later, dated from when they subscribed: a sequence without fallback variants skips those whose fields match none.
 - A step skipped for want of room in the month isn't sent later.
 - One fixed quiet window (03:00 to 06:00 Amsterdam) for every contact, not each reader's own time zone.
 - No test email per variant: send yourself a campaign with its content.

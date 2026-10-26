@@ -334,11 +334,13 @@ describe("sequences", () => {
 		// The first step goes from the signup itself, no run needed, unless it came in the quiet hours.
 		const sentAtSignup = emailsTo("mira@series.example.org").length;
 		assert.equal(sentAtSignup, isQuietTime(new Date()) ? 0 : 1);
+		// The run takes in the contact from before the sequence was active too.
 		await runDue(0);
 		for (const [address, subject] of [
 			["mira@series.example.org", "Welcome, Mira"],
 			["noor@series.example.org", "Welcome, Noor"],
 			["jonas@series.example.org", "Welcome, friend"],
+			["early@series.example.org", "Welcome, friend"],
 		]) {
 			assert.deepEqual(
 				emailsTo(address).map((email) => email.subject),
@@ -346,7 +348,6 @@ describe("sequences", () => {
 				address
 			);
 		}
-		assert.equal(emailsTo("early@series.example.org").length, 0);
 
 		await runDue(1);
 		assert.deepEqual(emailsTo("mira@series.example.org").map(({ subject }) => subject).at(-1), "Scorpio: what your Sun sign describes");
@@ -363,19 +364,20 @@ describe("sequences", () => {
 		assert.equal(emailsTo("mira@series.example.org").at(-1).subject, "Scorpio only");
 		assert.equal(emailsTo("noor@series.example.org").length, 2, "no variant for noor in step 3");
 		assert.equal(emailsTo("jonas@series.example.org").length, 2, "nor for jonas");
+		assert.equal(emailsTo("early@series.example.org").at(-1).subject, "Scorpio only");
 
 		const report = await ok(api(user.key, "GET", `/sequences/${sequence.id}`));
 		assert.deepEqual(
 			report.steps.map(({ stats }) => [stats.queued, stats.sent]),
 			[
-				[3, 3],
-				[3, 3],
-				[1, 1],
+				[4, 4],
+				[4, 4],
+				[2, 2],
 			]
 		);
-		assert.deepEqual(report.contacts, { active: 0, paused: 0, completed: 3, stopped: 0 });
+		assert.deepEqual(report.contacts, { active: 0, paused: 0, completed: 4, stopped: 0 });
 		const messages = await m.Message.find({ accountId: user.accountId, kind: "sequence" }).lean();
-		assert.equal(messages.length, 7);
+		assert.equal(messages.length, 10);
 		assert.ok(messages.every(({ status, sequenceId }) => status === "sent" && String(sequenceId) === sequence.id));
 
 		const listed = await callTool(user.key, "list_sequences");
@@ -574,13 +576,15 @@ describe("sequences", () => {
 		await flushAfter();
 		assert.equal(await m.SequenceEnrollment.countDocuments({ accountId: user.accountId }), 1);
 
+		// Going on again, the run takes in the contact who signed up during the pause.
 		await callTool(user.key, "update_sequence", { id: sequence.id, status: "active" });
 		await m.sequences.runDueSequenceSteps({ now: runAt(1) });
-		assert.equal(await m.Message.countDocuments({ accountId: user.accountId, kind: "sequence", status: "queued" }), 1);
+		assert.equal(await m.Message.countDocuments({ accountId: user.accountId, kind: "sequence", status: "queued" }), 2);
 		await ok(api(user.key, "DELETE", `/sequences/${sequence.id}`));
 		await runJobs();
 		assert.equal(emailsTo("kai@pausing.example.org").length, 1);
-		assert.equal(await m.Message.countDocuments({ accountId: user.accountId, kind: "sequence", status: "skipped" }), 1);
+		assert.equal(emailsTo("lou@pausing.example.org").length, 0);
+		assert.equal(await m.Message.countDocuments({ accountId: user.accountId, kind: "sequence", status: "skipped" }), 2);
 		assert.equal(await m.SequenceEnrollment.countDocuments({ accountId: user.accountId }), 0);
 		assertError(await api(user.key, "GET", `/sequences/${sequence.id}`), 404, "not_found");
 	});
@@ -875,6 +879,66 @@ describe("sequences", () => {
 		);
 		assert.equal(await m.Sequence.countDocuments({ accountId: user.accountId }), 1, "nothing saved");
 		assert.deepEqual(settings(await ok(api(user.key, "GET", `/sequences/${created.id}`))), [0, [[6, null], [null, "offer_ends_at"]]]);
+	});
+
+	test("a run takes in active contacts who never joined, from when they subscribed, once", async () => {
+		const user = await customer("backfill@example.com");
+		await signUp(user, "before@backfill.example.org");
+		await signUp(user, "left@backfill.example.org");
+		await flushAfter();
+		await m.Contact.updateOne({ accountId: user.accountId, email: "left@backfill.example.org" }, { $set: { status: "unsubscribed" } });
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Late start",
+				steps: [1, 3].map((dayOffset) => ({ dayOffset, variants: [variant(`Day ${dayOffset}`, "Hi.")] })),
+			}),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		await flushAfter();
+		assert.equal(await m.SequenceEnrollment.countDocuments({ accountId: user.accountId }), 0);
+
+		const contact = await m.Contact.findOne({ accountId: user.accountId, email: "before@backfill.example.org" }).lean();
+		const first = await runDue(0);
+		assert.equal(first.backfilled, 1);
+		assert.equal(first.queued, 0, "day 1 isn't due yet");
+		const enrollment = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: contact._id }).lean();
+		assert.equal(enrollment.status, "active");
+		assert.equal(enrollment.step, 0);
+		assert.equal(enrollment.startedAt.getTime(), (contact.confirmedAt ?? contact.createdAt).getTime());
+		assert.ok(enrollment.nextAt.getTime() >= contact.createdAt.getTime() + DAY_MS);
+
+		const second = await runDue(1);
+		assert.equal(second.backfilled, 0, "the second run finds it in");
+		assert.equal(second.queued, 1);
+		assert.deepEqual(emailsTo("before@backfill.example.org").map(({ subject }) => subject), ["Day 1"]);
+		assert.equal(await m.SequenceEnrollment.countDocuments({ accountId: user.accountId }), 1, "nobody else joined");
+	});
+
+	test("a run brings back a nextAt set later than its step is due, and queues it", async () => {
+		const user = await customer("unstick@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", { name: "Stuck", steps: [0, 1].map((dayOffset) => ({ dayOffset, variants: [variant(`Day ${dayOffset}`, "Hi.")] })) }),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		await signUp(user, "stuck@unstick.example.org");
+		await flushAfter();
+		await runDue(0);
+		assert.equal(emailsTo("stuck@unstick.example.org").length, 1);
+		const filter = { accountId: user.accountId, sequenceId: sequence.id };
+		await m.SequenceEnrollment.updateOne(filter, { $set: { nextAt: new Date(Date.now() + 30 * DAY_MS) } });
+
+		const result = await runDue(2);
+		assert.equal(result.unstuck, 1);
+		assert.equal(result.queued, 1);
+		assert.deepEqual(emailsTo("stuck@unstick.example.org").map(({ subject }) => subject), ["Day 0", "Day 1"]);
+		assert.equal((await m.SequenceEnrollment.findOne(filter).lean()).status, "completed");
+
+		// Paused and ended enrollments stay as they are.
+		const paused = await m.SequenceEnrollment.create({ ...filter, newsletterId: user.newsletterId, contactId: new m.Contact()._id, status: "paused", startedAt: new Date(0), nextAt: new Date(Date.now() + 30 * DAY_MS) });
+		assert.equal((await runDue(2)).unstuck, 0);
+		assert.equal((await m.SequenceEnrollment.findOne({ accountId: user.accountId, _id: paused._id }).lean()).nextAt.getTime(), paused.nextAt.getTime());
 	});
 
 	test("the cron route runs only with CRON_SECRET", async () => {

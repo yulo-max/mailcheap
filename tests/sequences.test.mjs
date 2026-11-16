@@ -954,3 +954,66 @@ describe("sequences", () => {
 		});
 	});
 });
+
+describe("reopening enrollments whose offer steps were skipped in an outage", () => {
+	test("goes back to the first step without a message, only for active non-buyers with a fresh time, and only once", async () => {
+		const user = await customer("reopen@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Reopen",
+				steps: [
+					{ dayOffset: 0, variants: [variant("Welcome", "Hi.")] },
+					{ dayOffset: 1, skipAfterField: "offer_expires_ts", variants: [variant("Offer", "Hi.")] },
+					{ dayOffset: 2, skipAfterField: "offer_expires_ts", variants: [variant("Last day", "Hi.")] },
+				],
+			}),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const seconds = (days) => String(Math.floor((Date.now() + days * DAY_MS) / 1000));
+		// The offer ends half a day in: the outage keeps the day-1 run from going until day 2, and both steps are skipped.
+		const ada = await signUp(user, "ada@reopen.example.org", { offer_expires_ts: seconds(1.5) });
+		const bo = await signUp(user, "bo@reopen.example.org", { offer_expires_ts: seconds(1.5), purchased: "yes" });
+		const cy = await signUp(user, "cy@reopen.example.org", { offer_expires_ts: seconds(1.5) });
+		const old = await signUp(user, "old@reopen.example.org", { offer_expires_ts: seconds(-1) });
+		await flushAfter();
+		await runDue(0);
+		await ok(api(user.key, "PATCH", `/contacts/${cy.id}`, { status: "unsubscribed" }));
+		await runDue(2.1);
+		const states = await m.SequenceEnrollment.find({ accountId: user.accountId, sequenceId: sequence.id }).lean();
+		assert.ok(states.filter((e) => e.status === "completed" && e.skippedSteps === 2).length >= 3, JSON.stringify(states));
+
+		const { reopenSkippedEnrollments } = await import("../lib/sequence-reopen.js");
+		const window = { sequenceId: sequence.id, endedFrom: new Date(Date.now() - HOUR_MS), endedTo: new Date(Date.now() + HOUR_MS), outageFrom: new Date(Date.now() + 0.5 * DAY_MS) };
+		const dry = await reopenSkippedEnrollments(window);
+		const byContact = Object.fromEntries(dry.results.map((row) => [row.contactId, row]));
+		assert.equal(dry.dryRun, true);
+		assert.equal(byContact[ada.id].eligible, true);
+		assert.equal(byContact[ada.id].resumeStep, 1);
+		assert.equal(byContact[bo.id].reason, "purchased");
+		assert.equal(byContact[cy.id]?.reason ?? "stopped", byContact[cy.id] ? "contact_unsubscribed" : "stopped");
+		assert.equal(byContact[old.id].reason, "time_passed_before_outage");
+		assert.ok(!JSON.stringify(dry).includes("@"), "no addresses");
+
+		// Without a fresh time it stays closed: the run would skip the step again.
+		const late = new Date(Date.now() + 2 * DAY_MS);
+		const early = await reopenSkippedEnrollments({ ...window, execute: true, schedule: { [byContact[ada.id].enrollmentId]: late } });
+		assert.equal(early.counts["not_reopened:time_not_refreshed"], 1);
+
+		await ok(api(user.key, "PATCH", `/contacts/${ada.id}/fields`, { fields: { offer_expires_ts: seconds(5) } }));
+		const nextAt = new Date(Date.now() + 60_000);
+		const done = await reopenSkippedEnrollments({ ...window, execute: true, schedule: { [byContact[ada.id].enrollmentId]: nextAt } });
+		assert.equal(done.counts.reopened, 1);
+		const again = await reopenSkippedEnrollments({ ...window, execute: true, schedule: { [byContact[ada.id].enrollmentId]: nextAt } });
+		assert.equal(again.counts.reopened, undefined, "an active enrollment isn't found again");
+
+		await runDue(2.2);
+		const subjects = (address) => emailsTo(address).map(({ subject }) => subject);
+		assert.deepEqual(subjects("ada@reopen.example.org"), ["Welcome", "Offer"]);
+		assert.deepEqual(subjects("bo@reopen.example.org"), ["Welcome"]);
+		const reopened = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: ada.id }).lean();
+		assert.equal(reopened.status, "active");
+		assert.equal(reopened.step, 2);
+		assert.ok(reopened.nextAt.getTime() >= runAt(2.2).getTime() + DAY_MS - 60_000, "the next step keeps its distance");
+	});
+});

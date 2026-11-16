@@ -941,6 +941,35 @@ describe("sequences", () => {
 		assert.equal((await m.SequenceEnrollment.findOne({ accountId: user.accountId, _id: paused._id }).lean()).nextAt.getTime(), paused.nextAt.getTime());
 	});
 
+	test("a pinned nextAt later than its step is due stays, and goes at that time", async () => {
+		const user = await customer("pinned@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", { name: "Pinned", steps: [0, 1].map((dayOffset) => ({ dayOffset, variants: [variant(`Day ${dayOffset}`, "Hi.")] })) }),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		await signUp(user, "pinned@pinned.example.org");
+		await flushAfter();
+		await runDue(0);
+		const filter = { accountId: user.accountId, sequenceId: sequence.id };
+		const pinnedAt = runAt(3);
+		await m.SequenceEnrollment.updateOne(filter, { $set: { nextAt: pinnedAt, nextAtPinned: true } });
+
+		const result = await runDue(2);
+		assert.equal(result.unstuck, 0);
+		assert.equal(result.queued, 0);
+		assert.equal((await m.SequenceEnrollment.findOne(filter).lean()).nextAt.getTime(), pinnedAt.getTime());
+		assert.deepEqual(emailsTo("pinned@pinned.example.org").map(({ subject }) => subject), ["Day 0"]);
+
+		const due = await m.sequences.runDueSequenceSteps({ now: runAtTime(pinnedAt) });
+		await runJobs();
+		assert.ok(due.queued >= 1, "runs count every account's steps");
+		assert.deepEqual(emailsTo("pinned@pinned.example.org").map(({ subject }) => subject), ["Day 0", "Day 1"]);
+		const ended = await m.SequenceEnrollment.findOne(filter).lean();
+		assert.equal(ended.status, "completed");
+		assert.equal(ended.nextAtPinned, undefined);
+	});
+
 	test("the cron route runs only with CRON_SECRET", async () => {
 		await withEnv({ CRON_SECRET: "cron-test-secret" }, async () => {
 			const denied = await m.cronRoute.GET(new Request("http://localhost:3000/api/cron/sequences"));
@@ -1004,6 +1033,7 @@ describe("reopening enrollments whose offer steps were skipped in an outage", ()
 		const nextAt = new Date(Date.now() + 60_000);
 		const done = await reopenSkippedEnrollments({ ...window, execute: true, schedule: { [byContact[ada.id].enrollmentId]: nextAt } });
 		assert.equal(done.counts.reopened, 1);
+		assert.equal((await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: ada.id }).lean()).nextAtPinned, true, "the run doesn't pull it back");
 		const again = await reopenSkippedEnrollments({ ...window, execute: true, schedule: { [byContact[ada.id].enrollmentId]: nextAt } });
 		assert.equal(again.counts.reopened, undefined, "an active enrollment isn't found again");
 
@@ -1014,6 +1044,75 @@ describe("reopening enrollments whose offer steps were skipped in an outage", ()
 		const reopened = await m.SequenceEnrollment.findOne({ accountId: user.accountId, contactId: ada.id }).lean();
 		assert.equal(reopened.status, "active");
 		assert.equal(reopened.step, 2);
+		assert.equal(reopened.nextAtPinned, undefined, "the pin held only its step");
 		assert.ok(reopened.nextAt.getTime() >= runAt(2.2).getTime() + DAY_MS - 60_000, "the next step keeps its distance");
+	});
+});
+
+describe("rescheduling enrollments waiting on a step", () => {
+	test("pins a later nextAt for active non-buyers whose time outlasts it, sends the step then, and only once", async () => {
+		const user = await customer("reschedule@example.com");
+		const sequence = await ok(
+			api(user.key, "POST", "/sequences", {
+				name: "Reschedule",
+				steps: [
+					{ dayOffset: 0, variants: [variant("Welcome", "Hi.")] },
+					{ dayOffset: 1, skipAfterField: "offer_expires_ts", variants: [variant("Offer", "Hi.")] },
+					{ dayOffset: 2, skipAfterField: "offer_expires_ts", variants: [variant("Last day", "Hi.")] },
+				],
+			}),
+			201
+		);
+		await ok(api(user.key, "PATCH", `/sequences/${sequence.id}`, { status: "active" }));
+		const offerEnds = Date.now() + 10 * DAY_MS;
+		const offer = String(Math.floor(offerEnds / 1000));
+		const ada = await signUp(user, "ada@reschedule.example.org", { offer_expires_ts: offer });
+		const bo = await signUp(user, "bo@reschedule.example.org", { offer_expires_ts: offer, purchased: "yes" });
+		await flushAfter();
+		await runDue(0);
+		await runDue(1);
+		const subjects = (address) => emailsTo(address).map(({ subject }) => subject);
+		assert.deepEqual(subjects("ada@reschedule.example.org"), ["Welcome", "Offer"]);
+
+		const { rescheduleEnrollments } = await import("../lib/sequence-reschedule.js");
+		const window = { sequenceId: sequence.id, step: 2, nextAtFrom: new Date(Date.now() + DAY_MS), nextAtTo: new Date(Date.now() + 3 * DAY_MS) };
+		const dry = await rescheduleEnrollments(window);
+		const byContact = Object.fromEntries(dry.results.map((row) => [row.contactId, row]));
+		assert.equal(dry.dryRun, true);
+		assert.equal(dry.found, 2);
+		assert.equal(byContact[ada.id].eligible, true);
+		assert.equal(byContact[ada.id].fieldTime.getTime(), Math.floor(offerEnds / 1000) * 1000);
+		assert.ok(byContact[ada.id].lastSentAt, "the offer went");
+		assert.equal(byContact[bo.id].reason, "purchased");
+		assert.ok(!JSON.stringify(dry).includes("@"), "no addresses");
+		const { enrollmentId } = byContact[ada.id];
+
+		const tooClose = await rescheduleEnrollments({ ...window, execute: true, schedule: { [enrollmentId]: new Date(offerEnds - 30 * 60_000) } });
+		assert.equal(tooClose.counts["not_rescheduled:time_too_close"], 1);
+
+		// A run before the new time, out of the quiet hours, and one just after it.
+		const before = runAtTime(new Date(Date.now() + 4 * DAY_MS));
+		const nextAt = new Date(before.getTime() + 2 * HOUR_MS);
+		const done = await rescheduleEnrollments({ ...window, execute: true, schedule: { [enrollmentId]: nextAt } });
+		assert.equal(done.counts.rescheduled, 1);
+		const filter = { accountId: user.accountId, contactId: ada.id };
+		assert.equal((await m.SequenceEnrollment.findOne(filter).lean()).nextAtPinned, true);
+
+		const early = await m.sequences.runDueSequenceSteps({ now: before });
+		await runJobs();
+		assert.equal(early.unstuck, 0, JSON.stringify(early));
+		assert.deepEqual(subjects("ada@reschedule.example.org"), ["Welcome", "Offer"]);
+		assert.equal((await m.SequenceEnrollment.findOne(filter).lean()).nextAt.getTime(), nextAt.getTime());
+
+		await m.sequences.runDueSequenceSteps({ now: runAtTime(nextAt) });
+		await runJobs();
+		assert.deepEqual(subjects("ada@reschedule.example.org"), ["Welcome", "Offer", "Last day"]);
+		const ended = await m.SequenceEnrollment.findOne(filter).lean();
+		assert.equal(ended.status, "completed");
+		assert.equal(ended.nextAtPinned, undefined);
+
+		const again = await rescheduleEnrollments({ ...window, execute: true, schedule: { [enrollmentId]: nextAt } });
+		assert.equal(again.found, 0, "the step moved on");
+		assert.equal(again.counts.rescheduled, undefined);
 	});
 });

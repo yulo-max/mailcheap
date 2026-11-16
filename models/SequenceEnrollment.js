@@ -15,6 +15,8 @@ const enrollmentSchema = new mongoose.Schema(
 		startedAt: { type: Date, required: true },
 		step: { type: Number, default: 0 },
 		nextAt: { type: Date },
+		// nextAt was set on purpose (a repair that spreads sends): the run never moves it earlier.
+		nextAtPinned: { type: Boolean },
 		// When the last step was queued: a late step keeps its distance to the next.
 		lastQueuedAt: { type: Date },
 		// Steps the contact skipped: reached too late, or past the contact's own time (models/Sequence.js).

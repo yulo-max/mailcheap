@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/cron/sequences",
-      "schedule": "0 8 * * *"
+      "schedule": "*/15 * * * *"
     },
     {
       "path": "/api/cron/postmaster",
